@@ -3,6 +3,7 @@ package models
 import (
 	bytes "bytes"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"regexp"
 	"time"
@@ -12,6 +13,8 @@ import (
 
 const PreloadedRootFSScheme = "preloaded"
 const PreloadedOCIRootFSScheme = "preloaded+layer"
+
+const maxAllowedSize = 1 * 1024 * 1024 // 1MB in bytes
 
 var processGuidPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -37,6 +40,16 @@ func NewDesiredLRP(schedInfo DesiredLRPSchedulingInfo, runInfo DesiredLRPRunInfo
 	for i := range runInfo.EnvironmentVariables {
 		environmentVariables[i] = &runInfo.EnvironmentVariables[i]
 	}
+
+	serviceBindingFiles := make([]*Files, len(runInfo.ServiceBindingFiles))
+	for i := range runInfo.ServiceBindingFiles {
+		serviceBindingFiles[i] = runInfo.ServiceBindingFiles[i]
+	}
+
+	// Remove me
+	serviceBindingFiles = append(serviceBindingFiles, &Files{Name: "/redis/username", Value: "redis_user"})
+	serviceBindingFiles = append(serviceBindingFiles, &Files{Name: "/redis/password", Value: "redis_password"})
+	// End of Remove Me
 
 	egressRules := make([]*SecurityGroupRule, len(runInfo.EgressRules))
 	for i := range runInfo.EgressRules {
@@ -80,6 +93,7 @@ func NewDesiredLRP(schedInfo DesiredLRPSchedulingInfo, runInfo DesiredLRPRunInfo
 		MetricTags:                    runInfo.MetricTags,
 		Sidecars:                      runInfo.Sidecars,
 		LogRateLimit:                  runInfo.LogRateLimit,
+		ServiceBindingFiles:           serviceBindingFiles,
 	}
 }
 
@@ -87,6 +101,11 @@ func (desiredLRP *DesiredLRP) AddRunInfo(runInfo DesiredLRPRunInfo) {
 	environmentVariables := make([]*EnvironmentVariable, len(runInfo.EnvironmentVariables))
 	for i := range runInfo.EnvironmentVariables {
 		environmentVariables[i] = &runInfo.EnvironmentVariables[i]
+	}
+
+	serviceBindingFiles := make([]*Files, len(runInfo.ServiceBindingFiles))
+	for i := range runInfo.ServiceBindingFiles {
+		serviceBindingFiles[i] = runInfo.ServiceBindingFiles[i]
 	}
 
 	egressRules := make([]*SecurityGroupRule, len(runInfo.EgressRules))
@@ -111,6 +130,7 @@ func (desiredLRP *DesiredLRP) AddRunInfo(runInfo DesiredLRPRunInfo) {
 	desiredLRP.VolumeMounts = runInfo.VolumeMounts
 	desiredLRP.Network = runInfo.Network
 	desiredLRP.CheckDefinition = runInfo.CheckDefinition
+	desiredLRP.ServiceBindingFiles = serviceBindingFiles
 }
 
 func (*DesiredLRP) Version() format.Version {
@@ -266,6 +286,11 @@ func (d *DesiredLRP) DesiredLRPRunInfo(createdAt time.Time) DesiredLRPRunInfo {
 		environmentVariables[i] = *d.EnvironmentVariables[i]
 	}
 
+	serviceBindingFiles := make([]*Files, len(d.ServiceBindingFiles))
+	for i := range d.ServiceBindingFiles {
+		serviceBindingFiles[i] = d.ServiceBindingFiles[i]
+	}
+
 	egressRules := make([]SecurityGroupRule, len(d.EgressRules))
 	for i := range d.EgressRules {
 		egressRules[i] = *d.EgressRules[i]
@@ -298,6 +323,7 @@ func (d *DesiredLRP) DesiredLRPRunInfo(createdAt time.Time) DesiredLRPRunInfo {
 		d.MetricTags,
 		d.Sidecars,
 		d.LogRateLimit,
+		serviceBindingFiles,
 	)
 }
 
@@ -308,6 +334,13 @@ func (d *DesiredLRP) Copy() *DesiredLRP {
 
 func (desired DesiredLRP) Validate() error {
 	var validationError ValidationError
+
+	if len(desired.ServiceBindingFiles) > 0 {
+		err := validateServiceBindingFiles(desired.ServiceBindingFiles)
+		if err != nil {
+			validationError = validationError.Append(ErrInvalidField{"serviceBindingFiles"})
+		}
+	}
 
 	if desired.GetDomain() == "" {
 		validationError = validationError.Append(ErrInvalidField{"domain"})
@@ -653,6 +686,7 @@ func NewDesiredLRPRunInfo(
 	metricTags map[string]*MetricTagValue,
 	sidecars []*Sidecar,
 	logRateLimit *LogRateLimit,
+	serviceBindingFiles []*Files,
 ) DesiredLRPRunInfo {
 	return DesiredLRPRunInfo{
 		DesiredLRPKey:                 key,
@@ -681,6 +715,7 @@ func NewDesiredLRPRunInfo(
 		MetricTags:                    metricTags,
 		Sidecars:                      sidecars,
 		LogRateLimit:                  logRateLimit,
+		ServiceBindingFiles:           serviceBindingFiles,
 	}
 }
 
@@ -688,6 +723,13 @@ func (runInfo DesiredLRPRunInfo) Validate() error {
 	var validationError ValidationError
 
 	validationError = validationError.Check(runInfo.DesiredLRPKey)
+
+	if len(runInfo.ServiceBindingFiles) > 0 {
+		err := validateServiceBindingFiles(runInfo.ServiceBindingFiles)
+		if err != nil {
+			validationError = validationError.Append(ErrInvalidField{"serviceBindingFiles"})
+		}
+	}
 
 	if runInfo.Setup != nil {
 		if err := runInfo.Setup.Validate(); err != nil {
@@ -781,5 +823,16 @@ func (*CertificateProperties) Version() format.Version {
 }
 
 func (CertificateProperties) Validate() error {
+	return nil
+}
+
+func validateServiceBindingFiles(files []*Files) error {
+	var totalSize int
+	for _, file := range files {
+		totalSize += len(file.Value)
+		if totalSize > maxAllowedSize {
+			return errors.New("total size of all file values exceeds 1MB")
+		}
+	}
 	return nil
 }
